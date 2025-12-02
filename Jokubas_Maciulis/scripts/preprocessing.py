@@ -52,5 +52,5 @@ def load_dataset_from_txt(txt_file, target_label, max_events = None, branches = 
     return df.reset_index(drop=True)
 
 # For testing
-branches = ["Electron_pt", "Electron_eta", "run", "event"]
-print(load_dataset_from_txt("data/raw/background/CMS_mc_RunIISummer20UL16NanoAODv9_ST_tW_antitop_5f_NoFullyHadronicDecays_TuneCP5_13TeV-powheg-pythia8_NANOAODSIM_106X_mcRun2_asymptotic_v17-v1_270000_file_index.txt", 1, 3000, branches = branches))
+# branches = ["Electron_pt", "Electron_eta", "run", "event"]
+# print(load_dataset_from_txt("data/raw/background/CMS_mc_RunIISummer20UL16NanoAODv9_ST_tW_antitop_5f_NoFullyHadronicDecays_TuneCP5_13TeV-powheg-pythia8_NANOAODSIM_106X_mcRun2_asymptotic_v17-v1_270000_file_index.txt", 1, 3000, branches = branches))
