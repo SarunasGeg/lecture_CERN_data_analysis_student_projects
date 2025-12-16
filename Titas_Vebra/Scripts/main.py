@@ -1,15 +1,27 @@
 import os
+import json
+import argparse
 import pandas as pd
 from pandas.errors import ParserError
+from pathlib import Path
+import re
 
-Root_dir = os.getcwd()
+# Change if scripts arent inside Scripts folder
+project_root = Path(__file__).resolve().parent.parent
+
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError("Config must be a JSON object (dictionary).")
+    return cfg
 
 def _update_cleaning_log(action: str, before_df: pd.DataFrame, after_df: pd.DataFrame, log_entries: list):
     """
-    Append human-readable info about what changed during one cleaning action.
+    Appends info to txt about what changed.
     """
 
-    # 1) Remove rows and columns -> list which rows/columns disappeared
+    # 1) Remove rows and columns -> lists which rows/columns disappeared
     if action == "Remove rows and columns":
         # rows removed: compare index labels before/after,
         # then convert to 1-based positions in the BEFORE table
@@ -25,12 +37,34 @@ def _update_cleaning_log(action: str, before_df: pd.DataFrame, after_df: pd.Data
         )
         return
 
-    # 2) Strip whitespace -> just note it was done
+    # 2) Strip whitespace -> notes what was done
     if action == "Strip whitespace":
-        log_entries.append("Strip whitespace: action performed.")
+        # Count value changes exactly as strip_whitespace() does:
+        # only object columns, only real strings, strip leading/trailing whitespace.
+        obj_cols = before_df.select_dtypes(include=["object"]).columns
+
+        cells_changed = 0
+        for col in obj_cols:
+            b = before_df[col]
+            stripped = b.apply(lambda v: v.strip() if isinstance(v, str) else v)
+
+            diff = ~(b.eq(stripped) | (b.isna() & stripped.isna()))
+            cells_changed += int(diff.sum())
+
+        # Column name changes (simple, accurate)
+        before_cols = list(before_df.columns)
+        after_cols_expected = [c.strip() if isinstance(c, str) else c for c in before_cols]
+        col_names_changed = sum(
+            1 for b, a in zip(before_cols, after_cols_expected) if b != a
+        )
+
+        log_entries.append(
+            f"Strip whitespace: changed {cells_changed} cell(s); "
+            f"changed {col_names_changed} column name(s)."
+        )
         return
 
-    # 3) Normalize missing values -> which coordinates became missing
+    # 3) Normalize missing values -> notes which coordinates changed to missing
     if action == "Normalize missing values":
         # map index -> 1-based row position for nicer logging
         row_pos = {idx: i + 1 for i, idx in enumerate(before_df.index)}
@@ -63,17 +97,68 @@ def _update_cleaning_log(action: str, before_df: pd.DataFrame, after_df: pd.Data
             log_entries.append("Normalize missing values: no values changed.")
         return
 
-    # 4) Fix decimal commas -> just note it
+    # 4) Fix decimal commas -> notes that it was done
     if action == "Fix decimal commas":
-        log_entries.append("Fix decimal commas: action performed.")
+
+        obj_cols = before_df.select_dtypes(include=["object"]).columns
+
+        def _is_comma_case(s: str) -> bool:
+            s = s.strip()
+            if "," in s:
+                return True
+            # EU thousands style like 1.234,56 (comma decimal) or 1.234
+            if re.fullmatch(r"[+-]?\d{1,3}(?:\.\d{3})+(?:,\d+)?", s):
+                return True
+            return False
+
+        def _maybe_convert(v):
+            if pd.isna(v) or not isinstance(v, str):
+                return v
+            s = v.strip()
+            if s == "":
+                return v
+
+            if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+\.\d+", s):  # 1,234.56
+                return float(s.replace(",", ""))
+            if re.fullmatch(r"[+-]?\d{1,3}(?:\.\d{3})+,\d+", s):  # 1.234,56
+                return float(s.replace(".", "").replace(",", "."))
+            if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+", s):       # 10,000
+                return float(s.replace(",", ""))
+            if re.fullmatch(r"[+-]?\d+,\d+", s):                 # 12,5
+                return float(s.replace(",", "."))
+
+            # IMPORTANT: don't count or change plain "1234" / "12.5" here for this log
+            return v
+
+        cells_changed = 0
+        for col in obj_cols:
+            b = before_df[col]
+            mask = b.apply(lambda x: isinstance(x, str) and _is_comma_case(x))
+
+            converted = b.where(~mask, b.apply(_maybe_convert))
+            diff = ~(b.eq(converted) | (b.isna() & converted.isna()))
+            cells_changed += int(diff.sum())
+
+        log_entries.append(f"Fix decimal commas: changed {cells_changed} cell(s).")
         return
 
-    # 5) Extract numeric value + units -> just note it
+        cells_changed = 0
+        for col in obj_cols:
+            b = before_df[col]
+            converted = b.apply(_maybe_convert)
+
+            diff = ~(b.eq(converted) | (b.isna() & converted.isna()))
+            cells_changed += int(diff.sum())
+
+        log_entries.append(f"Fix decimal commas: changed {cells_changed} cell(s).")
+        return
+
+    # 5) Extract numeric value + units -> notes that it was done
     if action == "Extract numeric value + units":
         log_entries.append("Extract numeric value + units: action performed.")
         return
 
-    # 6) Convert units to SI -> record unit-string changes in *_unit columns
+    # 6) Convert units to SI -> records unit-string changes in *_unit columns
     if action == "Convert units to SI":
         changes = {}
         common_cols = before_df.columns.intersection(after_df.columns)
@@ -99,7 +184,7 @@ def _update_cleaning_log(action: str, before_df: pd.DataFrame, after_df: pd.Data
             log_entries.append("Convert units to SI: no unit changes detected.")
         return
 
-    # 7) Clear duplicate rows -> which original row indices were dropped
+    # 7) Clear duplicate rows -> notes which rows were removed
     if action == "Clear duplicate rows":
         # True where the row is a duplicate of a previous one (this is what pandas drops)
         dup_mask = before_df.duplicated(keep="first")
@@ -114,17 +199,17 @@ def _update_cleaning_log(action: str, before_df: pd.DataFrame, after_df: pd.Data
             log_entries.append("Clear duplicate rows: no duplicates found.")
         return
 
-    # 8) Move rows or columns -> just note it
+    # 8) Move rows or columns -> notes that it was done
     if action == "Move rows or columns":
         log_entries.append("Move rows or columns: action performed.")
         return
 
-    # 9) Plot data
+    # 9) Plot data -> notes that it was done(if selected with other actions)
     if action == "Plot data":
         log_entries.append("Plot data: plotting was performed.")
         return
 
-    # 10) Generate LaTeX table
+    # 10) Generate LaTeX table -> notes that it was done(if selected with other actions)
     if action == "Generate LaTeX table":
         log_entries.append("Generate LaTeX table: LaTeX table was generated.")
         return
@@ -266,9 +351,9 @@ def choose_output_path() -> str:
     print("\n==============================")
     print("Saving cleaned CSV")
     print("==============================")
-    print("Project directory:", Root_dir)
+    print("Project directory:", project_root)
 
-    print("\nEnter output file path relative to the working directory.")
+    print("\nEnter output file path relative to the project directory.")
     print("Examples:")
     print("   cleaned.csv")
     print("   Cleaned_csv/Cleaned.csv")
@@ -281,12 +366,11 @@ def choose_output_path() -> str:
             print("Output must end with .csv")
             continue
 
-        # Save relative to the project folder
-        output_path = os.path.join(Root_dir, out)
+        # Save relative to the working folder
+        output_path = project_root / out
 
         # Make folder(s) if needed
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         return output_path
     
 # Helper to read messy
@@ -321,20 +405,67 @@ def load_csv_loose(csv_path: str) -> pd.DataFrame:
         )
 
 def main():
-    csv_path = browse_and_choose_csv()
-    if csv_path is None:
-        print("\nNo CSV selected.")
-        return
+
+    # Action imports
+    from csv_actions import (
+        remove_rows_and_columns,
+        strip_whitespace,
+        normalize_missing_values,
+        fix_decimal_commas,
+        extract_numeric_and_unit,
+        convert_units_to_SI,
+        remove_duplicate_rows,
+        move_rows_or_columns,
+        plot_data,
+        generate_latex_table,
+    )
+
+    Action_funcs = {
+        "Remove rows and columns": remove_rows_and_columns,
+        "Strip whitespace": strip_whitespace,
+        "Normalize missing values": normalize_missing_values,
+        "Fix decimal commas": fix_decimal_commas,
+        "Extract numeric value + units": extract_numeric_and_unit,
+        "Convert units to SI": convert_units_to_SI,
+        "Clear duplicate rows": remove_duplicate_rows,
+        "Move rows or columns": move_rows_or_columns,
+    }
+    
+    parser = argparse.ArgumentParser(description="CSV Cleaner (interactive or config-driven)")
+    parser.add_argument("--config", help="Path to a JSON config file (runs non-interactively)")
+    args = parser.parse_args()
+
+    cfg = None
+    if args.config:
+        cfg = load_config(args.config)
+
+    # -------- choose CSV --------
+    if cfg:
+        csv_path = cfg.get("input_csv") or cfg.get("csv_path")
+        if not csv_path:
+            print("Config missing 'input_csv' (or 'csv_path').")
+            return
+        # allow relative paths
+        csv_path = str((project_root / csv_path).resolve()) if not os.path.isabs(csv_path) else csv_path
+        if not os.path.exists(csv_path):
+            print(f"Config CSV not found: {csv_path}")
+            return
+        print(f"\n[CONFIG] Using CSV: {csv_path}")
+    else:
+        csv_path = browse_and_choose_csv()
+        if csv_path is None:
+            print("\nNo CSV selected.")
+            return
 
     file = load_csv_loose(csv_path)
 
-    chosen_actions = choose_csv_actions()
+    chosen_actions = (cfg.get('actions') if cfg else choose_csv_actions())
     if chosen_actions is None:
         print("No actions selected.")
         return
 
     # ---------------------------------
-    # Decide if any chosen actions modify the CSV
+    # Decides if any chosen actions modify the CSV
     # ---------------------------------
     mutating_actions = [
         a for a in chosen_actions
@@ -342,19 +473,23 @@ def main():
     ]
 
     if mutating_actions:
-        # Ask if the user wants a cleaning log (ONLY if something can change the CSV)
-        while True:
-            ans = input(
-                "\nGenerate cleaning log (.txt) next to cleaned CSV? (y/n): "
-            ).strip().lower()
-            if ans in ("y", "yes"):
-                log_enabled = True
-                break
-            elif ans in ("n", "no"):
-                log_enabled = False
-                break
-            else:
-                print("Please type y or n.")
+        # Cleaning log: in config mode use cfg['log_enabled'] (default True),
+        # otherwise ask interactively.
+        if cfg is not None:
+            log_enabled = bool(cfg.get("log_enabled", True))
+        else:
+            while True:
+                ans = input(
+                    "\nGenerate cleaning log (.txt) next to cleaned CSV? (y/n): "
+                ).strip().lower()
+                if ans in ("y", "yes"):
+                    log_enabled = True
+                    break
+                elif ans in ("n", "no"):
+                    log_enabled = False
+                    break
+                else:
+                    print("Please type y or n.")
 
         log_entries = []
         if log_enabled:
@@ -369,42 +504,19 @@ def main():
         log_entries = []
     # ---------------------------------
 
+
     # ----------------------------
     # Importing actions
     # ----------------------------
     for action in chosen_actions:
-        before_df = file.copy(deep=True)
+        before_df = file if log_enabled else None
 
-        if action == "Remove rows and columns":
-            from csv_actions import remove_rows_and_columns
-            file = remove_rows_and_columns(file)
-        if action == "Strip whitespace":
-            from csv_actions import strip_whitespace
-            file = strip_whitespace(file)
-        if action == "Normalize missing values":
-            from csv_actions import normalize_missing_values
-            file = normalize_missing_values(file)
-        if action == "Fix decimal commas":
-            from csv_actions import fix_decimal_commas
-            file = fix_decimal_commas(file)
-        if action == "Extract numeric value + units":
-            from csv_actions import extract_numeric_and_unit
-            file = extract_numeric_and_unit(file)
-        if action == "Convert units to SI":
-            from csv_actions import convert_units_to_SI
-            file = convert_units_to_SI(file)
-        if action == "Clear duplicate rows":
-            from csv_actions import remove_duplicate_rows
-            file = remove_duplicate_rows(file)
-        if action == "Move rows or columns":
-            from csv_actions import move_rows_or_columns
-            file = move_rows_or_columns(file)
         if action == "Plot data":
-            from csv_actions import plot_data
-            file = plot_data(file, file_path=csv_path)
-        if action == "Generate LaTeX table":
-            from csv_actions import generate_latex_table
-            file = generate_latex_table(file)
+            file = plot_data(file, file_path=csv_path, config=(cfg.get("plot") if cfg else None))
+        elif action == "Generate LaTeX table":
+            file = generate_latex_table(file, config=(cfg.get("latex") if cfg else None))
+        else:
+            file = Action_funcs[action](file)
 
         if log_enabled:
             _update_cleaning_log(action, before_df, file, log_entries)
@@ -413,13 +525,17 @@ def main():
     save_needed = any(a not in ("Plot data", "Generate LaTeX table") for a in chosen_actions)
 
     if save_needed:
-        output_path = choose_output_path()
+        output_path = (
+            project_root / cfg.get("output_csv")
+            if (cfg and cfg.get("output_csv"))
+            else choose_output_path()
+        )
         file.to_csv(output_path, index=False)
         print(f"\nSaved cleaned file as:\n{output_path}")
 
         if log_enabled:
-            base, _ = os.path.splitext(output_path)
-            log_path = base + "_log.txt"
+            log_path = output_path.with_suffix("")  # remove .csv
+            log_path = log_path.with_name(log_path.name + "_log.txt")
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(log_entries))
             print(f"\nCleaning log saved as:\n{log_path}")
